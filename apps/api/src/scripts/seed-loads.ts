@@ -20,6 +20,45 @@ interface SeedLoad {
   dimensions?: string;
 }
 
+/**
+ * Rebases all pickup/delivery timestamps in the seed JSON so the *earliest*
+ * pickup always falls on "tomorrow at midnight UTC" relative to when the seed
+ * runs, while preserving the relative offsets between loads.
+ *
+ * Why: the JSON ships with hard-coded ISO timestamps (a snapshot of what an
+ * idealized load board looked like on 2026-05-06). On any other day, those
+ * dates are stale — at best Avery pitches "pickup yesterday", at worst the
+ * agent says something nonsensical on a recorded demo. Rebasing keeps the
+ * fixtures alive forever with zero JSON edits.
+ *
+ * The earliest pickup in the JSON is treated as "tomorrow"; every other date
+ * shifts by the same whole-day offset so a load that was originally three
+ * days after the earliest one stays three days after "tomorrow".
+ */
+function rebasePickupDates(loads: SeedLoad[]): { offsetDays: number; rebased: SeedLoad[] } {
+  const earliestPickupMs = Math.min(
+    ...loads.map((l) => Date.parse(l.pickup_datetime)),
+  );
+  const earliestMidnight = new Date(earliestPickupMs);
+  earliestMidnight.setUTCHours(0, 0, 0, 0);
+
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const tomorrowUtc = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+
+  const offsetMs = tomorrowUtc.getTime() - earliestMidnight.getTime();
+  const offsetDays = Math.round(offsetMs / (24 * 60 * 60 * 1000));
+
+  const shift = (iso: string) => new Date(Date.parse(iso) + offsetMs).toISOString();
+
+  const rebased = loads.map((l) => ({
+    ...l,
+    pickup_datetime: shift(l.pickup_datetime),
+    delivery_datetime: shift(l.delivery_datetime),
+  }));
+  return { offsetDays, rebased };
+}
+
 // Wipe an entire collection in 400-doc batches (Firestore batch limit is 500).
 async function wipeCollection(db: Firestore, name: string): Promise<number> {
   let total = 0;
@@ -74,10 +113,15 @@ async function main() {
     resolve(here, "..", "..", "..", "..", "infra", "sample-loads.json");
 
   const raw = await readFile(dataPath, "utf-8");
-  const loads = JSON.parse(raw) as SeedLoad[];
+  const loadsRaw = JSON.parse(raw) as SeedLoad[];
+  const { offsetDays, rebased: loads } = rebasePickupDates(loadsRaw);
 
   console.log(
     `Resetting Firestore (project=${projectId}, emulator=${useEmulator}, reset_calls=${wipeCalls})`,
+  );
+  console.log(
+    `  ↳ rebased pickup/delivery dates by ${offsetDays >= 0 ? "+" : ""}${offsetDays} day(s) ` +
+      `(earliest pickup is now ${loads.reduce((min, l) => (l.pickup_datetime < min ? l.pickup_datetime : min), loads[0]?.pickup_datetime ?? "")})`,
   );
 
   const wipedLoads = await wipeCollection(db, "loads");
