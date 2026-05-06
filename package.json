@@ -1,0 +1,26 @@
+{
+  "name": "happyrobot-inbound-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FDE Technical Challenge: Inbound Carrier Sales POC built on HappyRobot + Fastify + Firestore",
+  "packageManager": "pnpm@9.6.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "predev": "pnpm --filter @hr/shared build",
+    "dev": "pnpm -r --parallel run dev",
+    "build": "pnpm -r run build",
+    "lint": "pnpm -r run lint",
+    "typecheck": "pnpm -r run typecheck",
+    "preseed": "pnpm --filter @hr/shared build",
+    "seed": "pnpm --filter @hr/api run seed",
+    "prereset": "pnpm --filter @hr/shared build",
+    "reset": "pnpm --filter @hr/api run reset",
+    "test": "pnpm -r run test"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "concurrently": "^9.1.0"
+  }
+}

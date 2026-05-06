@@ -1,0 +1,17 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - "build"
+      - "-f"
+      - "apps/dashboard/Dockerfile"
+      - "--build-arg"
+      - "VITE_API_BASE_URL=${_API_URL}"
+      - "-t"
+      - "gcr.io/${PROJECT_ID}/hr-dashboard:latest"
+      - "."
+images:
+  - "gcr.io/${PROJECT_ID}/hr-dashboard:latest"
+substitutions:
+  _API_URL: ""
+options:
+  logging: CLOUD_LOGGING_ONLY

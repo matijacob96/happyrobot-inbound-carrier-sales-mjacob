@@ -1,0 +1,41 @@
+# Files for `gcloud builds submit .` to ignore — keeps the upload small.
+# Same spirit as .dockerignore, but evaluated by gcloud before sending to Cloud Build.
+
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build outputs
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*-key.json
+service-account.json
+
+# logs / cache
+*.log
+.cache/
+.firebase/
+.turbo/
+
+# version control / editor / OS
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# agent / IDE artifacts
+.claude/
+.cursor/
+
+# docs (not needed for the build, smaller upload)
+docs/
+*.md
