@@ -1,44 +1,40 @@
 import type { MetricsSummary } from "@hr/shared";
 
-const STORAGE_KEY = "hr.api.key";
 const BASE_URL_KEY = "hr.api.base";
 
+/**
+ * Resolve the base URL the dashboard should hit.
+ *
+ * Priority:
+ *   1. localStorage override (only set via the hidden ?settings=1 panel — debug)
+ *   2. VITE_API_BASE_URL injected at build time (kept as an escape hatch)
+ *   3. "/api" — same-origin path served by the nginx BFF in the dashboard
+ *      container, which proxies to the real API and injects x-api-key
+ *      server-side. The browser never holds an API key.
+ *
+ * In Vite dev (`pnpm dev`) the dev server proxies /api the same way; see
+ * vite.config.ts.
+ */
 export function getApiBase(): string {
   return (
     localStorage.getItem(BASE_URL_KEY) ??
     (import.meta.env.VITE_API_BASE_URL as string | undefined) ??
-    ""
+    "/api"
   );
 }
 
 export function setApiBase(value: string): void {
-  localStorage.setItem(BASE_URL_KEY, value);
-}
-
-export function getApiKey(): string {
-  return localStorage.getItem(STORAGE_KEY) ?? "";
-}
-
-export function setApiKey(value: string): void {
-  localStorage.setItem(STORAGE_KEY, value);
-}
-
-export function clearApiKey(): void {
-  localStorage.removeItem(STORAGE_KEY);
+  if (value) localStorage.setItem(BASE_URL_KEY, value);
+  else localStorage.removeItem(BASE_URL_KEY);
 }
 
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const base = getApiBase();
-  if (!base) throw new Error("API base URL is not configured.");
-  const key = getApiKey();
-  if (!key) throw new Error("API key is not configured.");
-
   const url = `${base.replace(/\/$/, "")}${path}`;
   const res = await fetch(url, {
     ...init,
     headers: {
       "content-type": "application/json",
-      "x-api-key": key,
       ...(init.headers ?? {}),
     },
   });

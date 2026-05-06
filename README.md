@@ -11,7 +11,9 @@ This repository contains everything needed to build, run and deploy the
 end-to-end stack:
 
 - **API** — Fastify + TypeScript service on Cloud Run.
-- **Dashboard** — React + Vite SPA on Cloud Run (served by nginx).
+- **Dashboard** — React + Vite SPA on Cloud Run (served by an nginx BFF that
+  proxies `/api/*` to the API and injects the API key server-side, so the
+  browser never holds a credential).
 - **Shared types** — internal package consumed by both apps.
 - **Infra** — Dockerfiles, Cloud Build configs, idempotent deploy script.
 - **Local dev** — Docker Compose stack with a Firestore emulator and an
@@ -57,7 +59,8 @@ flowchart LR
     WebhookOut --> API
     API --> Firestore[("Firestore: loads, calls, carriers")]
     API -->|"verify MC"| FMCSA["FMCSA QCMobile API"]
-    Dashboard["React Dashboard on Cloud Run"] -->|"x-api-key"| API
+    Browser["Operator browser"] -->|"same-origin /api/*"| Dashboard["nginx BFF (Cloud Run)"]
+    Dashboard -->|"x-api-key (from Secret Manager)"| API
 ```
 
 Key idea: **HappyRobot does the heavy lifting**. The custom backend is a
@@ -107,7 +110,7 @@ non-engineers to tune, fewer moving parts to deploy.
 │       │   ├── lib/             # api.ts, theme.tsx, search.tsx, data.tsx
 │       │   ├── App.tsx, main.tsx, index.css
 │       ├── Dockerfile
-│       ├── nginx.conf           # SPA fallback + security headers
+│       ├── nginx.conf.template  # SPA fallback + /api BFF (envsubst at boot)
 │       └── package.json
 ├── packages/
 │   └── shared/                  # Shared TS types (CallRecord, Load, MetricsSummary, ...)
@@ -173,10 +176,11 @@ Endpoints once the stack is up:
 | Dashboard           | <http://localhost:4173>      |
 | Firestore emulator  | <http://localhost:8085>      |
 
-Open the dashboard in a browser. On first visit it asks for an **API base
-URL** and **API key**. Use `http://localhost:8080` and the value of `API_KEY`
-from your `.env` (default: `dev-local-api-key-change-me`). Credentials are
-stored in `localStorage` and never sent anywhere except the configured API.
+Open the dashboard in a browser — no setup dialog, no credentials to paste.
+The dashboard's own nginx (the BFF) proxies `/api/*` to the API container
+(`UPSTREAM_API=http://api:8080` from `docker-compose.yml`) and injects the
+`x-api-key` header server-side from `API_KEY` in your `.env`. The browser
+only ever talks to the same origin.
 
 ### Smoke-test the API
 
@@ -245,9 +249,21 @@ local dev (via `.env` / `docker-compose.yml`) and for Cloud Run (via
 
 ### Dashboard (`apps/dashboard`)
 
-| Variable             | Required | Default                  | Notes |
-| -------------------- | -------- | ------------------------ | ----- |
-| `VITE_API_BASE_URL`  | no       | empty                    | Pre-fills the API base URL on first load. The user can still override it from the Settings dialog. Baked into the bundle at build time. |
+The dashboard ships an nginx BFF inside its own container. The browser only
+talks to the same origin (`/api/*`) — credentials never reach the browser.
+nginx renders these variables at boot via `envsubst` (the official nginx
+image supports `/etc/nginx/templates/*.template` out of the box):
+
+| Variable        | Required | Default                  | Notes |
+| --------------- | -------- | ------------------------ | ----- |
+| `UPSTREAM_API`  | yes      | `http://localhost:8080`  | Full base URL of the API the BFF proxies to. Set by `docker-compose.yml` locally and by `infra/deploy.sh` in Cloud Run. |
+| `API_KEY`       | yes      | empty                    | Injected as `x-api-key` server-side on every proxied request. Sourced from `.env` locally and from Secret Manager (`hr-api-key:latest`) in Cloud Run. |
+| `PORT`          | no       | `8080`                   | Cloud Run injects this. |
+
+The dashboard build also accepts an optional `VITE_API_BASE_URL` and a
+hidden `?settings=1` URL flag for debugging — handy if you want to point
+the SPA at a different API without redeploying. Day-to-day operation does
+not require either.
 
 ---
 
@@ -315,10 +331,13 @@ What the script does, in order:
 4. Builds the API image via `gcloud builds submit . --config=infra/cloudbuild.api.yaml`.
 5. Deploys the API to Cloud Run with HTTPS, public ingress, the env vars and
    the Secret Manager bindings.
-6. Builds the dashboard image with `_API_URL` substituted in at build time so
-   the SPA pre-fills its API base URL.
-7. Deploys the dashboard to Cloud Run.
-8. Prints both public URLs.
+6. Builds the dashboard image (no API URL baked in; runtime config only).
+7. Deploys the dashboard to Cloud Run with `UPSTREAM_API=<api url>` as an
+   env var and `API_KEY=hr-api-key:latest` as a secret. nginx inside the
+   container renders its config from those at boot.
+8. Tightens the API's `CORS_ORIGINS` to the dashboard URL once it is known
+   (so direct browser calls from any other origin are rejected).
+9. Prints both public URLs.
 
 ### Seed the production database
 
@@ -344,13 +363,17 @@ FIREBASE_PROJECT_ID="$PROJECT_ID" \
 echo -n "$(openssl rand -hex 32)" \
   | gcloud secrets versions add hr-api-key --data-file=-
 
-# 2. Roll the API to pick up :latest
+# 2. Roll BOTH services so they pick up :latest
 gcloud run services update hr-api \
   --region="$REGION" \
   --update-secrets=API_KEY=hr-api-key:latest
 
+gcloud run services update hr-dashboard \
+  --region="$REGION" \
+  --update-secrets=API_KEY=hr-api-key:latest
+
 # 3. Update HappyRobot's API_KEY workflow variable to the new value
-# 4. Update the dashboard's stored key (Settings dialog) when you next open it
+# (no changes needed in the browser — the BFF reads the secret, not the user)
 ```
 
 ---
@@ -457,7 +480,9 @@ Other niceties:
   `prefers-color-scheme`).
 - Global search bar that filters the active page.
 - Live updates via 10-second polling (no websockets needed).
-- Settings dialog (gear icon) to switch the API base URL and key on the fly.
+- All API traffic goes through the same-origin BFF (`/api/*`); no API key
+  is exposed to the browser. The BFF reads `API_KEY` from a Cloud Run
+  secret at container start.
 
 ---
 
@@ -494,30 +519,33 @@ authentication. This POC delivers that, plus several extras:
 - **`x-api-key`** enforced on every `/v1/*` route through a Fastify
   pre-handler with constant-time compare.
 - **Rate limit** of 120 req/min per IP via `@fastify/rate-limit`.
-- **CORS** allowlist driven by `CORS_ORIGINS`.
+- **CORS** allowlist driven by `CORS_ORIGINS`. The deploy script tightens
+  it to the dashboard's Cloud Run URL after the first deploy, so direct
+  browser calls from other origins are rejected.
 - **Secrets** (`API_KEY`, `FMCSA_API_KEY`) bound from Google Secret Manager
   at deploy time. Never committed to the repo or container image.
 - **Schema validation** (Zod) on every input and output.
+- **Backend-for-Frontend (BFF)** in the dashboard container: nginx serves
+  the SPA and proxies `/api/*` to the API, injecting `x-api-key` from a
+  Cloud Run secret server-side. The browser never holds a credential —
+  no Settings dialog, no `localStorage` token.
 - **nginx security headers** on the dashboard
   (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
   `Referrer-Policy: strict-origin-when-cross-origin`).
 
 ### Known trade-off
 
-Both HappyRobot's outbound webhook and the dashboard use the **same shared
-key**. The dashboard prompts the operator for the key on first load and
-stores it in `localStorage`. This is acceptable for a POC (single operator,
-demo-only surface, easily rotated) but **would not ship as-is** to
-production. The natural next steps are:
+HappyRobot's outbound webhook and the dashboard's BFF use the **same shared
+key** (`hr-api-key`). This is acceptable for a POC (single operator, single
+trusted webhook source, easily rotated with `gcloud secrets versions add`)
+but would not ship as-is to production. The natural next step is to split
+the key by scope:
 
-1. Split the key by scope: a `WRITE_API_KEY` (for HappyRobot, allowed on
-   `POST /v1/calls` and `POST /v1/loads/:id/book`) and a `READ_API_KEY` (for
-   the dashboard, GETs only).
-2. Move the dashboard's API client behind a tiny BFF (`nginx` proxying
-   `/api/*` and injecting `x-api-key` server-side from a Secret Manager
-   binding) so the browser never holds a credential.
+1. `WRITE_API_KEY` for HappyRobot, allowed only on `POST /v1/calls` and
+   `POST /v1/loads/:id/book`.
+2. `READ_API_KEY` for the dashboard's BFF, allowed on every `GET /v1/*`.
 3. Put the dashboard behind Cloud Run IAM / IAP so only authenticated
-   identities can reach it.
+   Acme identities can reach it.
 
 ---
 
@@ -525,7 +553,8 @@ production. The natural next steps are:
 
 | Symptom                                                              | Cause / fix                                                                                                                                                          |
 | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Browser shows *Failed to fetch* or CORS errors                       | The dashboard is hitting the API from an origin that isn't in `CORS_ORIGINS`. Update `.env` (local) or `--update-env-vars CORS_ORIGINS=...` (Cloud Run) and recreate the container (`docker compose up -d --force-recreate api`). |
+| Dashboard shows *Failed to fetch*                                    | The BFF (nginx in the dashboard container) cannot reach `UPSTREAM_API`. In docker-compose, make sure both `api` and `dashboard` are up; in Cloud Run, confirm `UPSTREAM_API` was set on `hr-dashboard` and that it points at the API URL (`gcloud run services describe hr-dashboard --region $REGION --format='value(spec.template.spec.containers[0].env)'`). |
+| Dashboard shows 401 / 403 from `/api/...`                            | The BFF is up but the `API_KEY` secret was not bound. Re-run `infra/deploy.sh` so the `--set-secrets API_KEY=hr-api-key:latest` flag is applied. Locally, make sure `API_KEY` is set in `.env`. |
 | `verify_carrier` returns 403 from FMCSA                              | The public FMCSA endpoint geo-blocks non-US IPs. For local dev set `FMCSA_MOCK=true`; in Cloud Run pick a US region and set `FMCSA_MOCK=false`.                      |
 | Seed script aborts with *"Refusing to seed/reset against Firestore"* | The script refuses to wipe a real GCP project unless you opt in. Either set `FIRESTORE_EMULATOR_HOST=...` (local) or pass `--allow-production`.                      |
 | `gcloud builds submit` complains about missing files                 | Run from the repo root; the Dockerfiles assume the monorepo as the build context. The deploy script does this automatically.                                         |

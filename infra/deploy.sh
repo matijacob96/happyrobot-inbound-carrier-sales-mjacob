@@ -7,6 +7,12 @@
 # Both services are built with `gcloud builds submit` using the monorepo root as
 # context (required by the workspace-aware Dockerfiles), then deployed with
 # `gcloud run deploy --image` pointing at gcr.io.
+#
+# Architecture:
+#   - hr-api        : public Cloud Run, x-api-key required (secret hr-api-key)
+#   - hr-dashboard  : public Cloud Run, runs an nginx BFF that proxies /api/* to
+#                     hr-api with x-api-key injected server-side. The browser
+#                     never holds a credential.
 
 set -euo pipefail
 
@@ -57,6 +63,18 @@ for s in hr-api-key hr-fmcsa-key; do
     --quiet >/dev/null
 done
 
+# Pre-compute the dashboard URL (if the service already exists) so we can lock
+# down CORS to that origin even on a fresh deploy. On the first ever deploy the
+# dashboard URL is unknown until step 6 — in that case the API gets CORS=* on
+# pass 1 and a tightened allowlist on pass 2.
+DASH_URL_EXISTING="$(gcloud run services describe "$DASHBOARD_SERVICE" --region "$REGION" --format='value(status.url)' 2>/dev/null || true)"
+if [[ -n "$DASH_URL_EXISTING" ]]; then
+  CORS_ORIGINS_VALUE="${CORS_ORIGINS:-$DASH_URL_EXISTING}"
+else
+  CORS_ORIGINS_VALUE="${CORS_ORIGINS:-*}"
+fi
+echo "==> CORS_ORIGINS=$CORS_ORIGINS_VALUE"
+
 # 3. Build the API image with the monorepo root as build context
 echo "==> Building $API_SERVICE image (context: repo root)"
 gcloud builds submit . \
@@ -74,21 +92,22 @@ gcloud run deploy "$API_SERVICE" \
   --memory 512Mi \
   --concurrency 40 \
   --max-instances 5 \
-  --set-env-vars "NODE_ENV=production,FIREBASE_PROJECT_ID=$PROJECT_ID,CORS_ORIGINS=*,FMCSA_MOCK=$FMCSA_MOCK" \
+  --set-env-vars "NODE_ENV=production,FIREBASE_PROJECT_ID=$PROJECT_ID,CORS_ORIGINS=$CORS_ORIGINS_VALUE,FMCSA_MOCK=$FMCSA_MOCK" \
   --set-secrets "API_KEY=hr-api-key:latest,FMCSA_API_KEY=hr-fmcsa-key:latest"
 
 API_URL="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --format='value(status.url)')"
 echo "    API_URL=$API_URL"
 
-# 5. Build the dashboard image with the API URL baked in at build time
-echo "==> Building $DASHBOARD_SERVICE image (context: repo root, API_URL=$API_URL)"
+# 5. Build the dashboard image (no API URL baked in any more — runtime config)
+echo "==> Building $DASHBOARD_SERVICE image (context: repo root)"
 gcloud builds submit . \
   --config=infra/cloudbuild.dashboard.yaml \
-  --substitutions=_API_URL="$API_URL" \
   --region="$REGION"
 
-# 6. Deploy the dashboard
-echo "==> Deploying $DASHBOARD_SERVICE"
+# 6. Deploy the dashboard. The nginx BFF inside this container proxies /api/*
+#    to UPSTREAM_API and injects x-api-key from the secret server-side, so
+#    the browser never holds a credential.
+echo "==> Deploying $DASHBOARD_SERVICE (BFF -> $API_URL)"
 gcloud run deploy "$DASHBOARD_SERVICE" \
   --image "gcr.io/$PROJECT_ID/hr-dashboard:latest" \
   --region "$REGION" \
@@ -96,9 +115,21 @@ gcloud run deploy "$DASHBOARD_SERVICE" \
   --allow-unauthenticated \
   --port 8080 \
   --memory 256Mi \
-  --max-instances 3
+  --max-instances 3 \
+  --set-env-vars "UPSTREAM_API=$API_URL" \
+  --set-secrets "API_KEY=hr-api-key:latest"
 
 DASH_URL="$(gcloud run services describe "$DASHBOARD_SERVICE" --region "$REGION" --format='value(status.url)')"
+
+# 7. Tighten CORS now that we know the dashboard URL. Idempotent; if the value
+#    didn't change Cloud Run will be a no-op. This protects the API from being
+#    called from an unknown browser origin (e.g. a stolen leaked URL).
+if [[ "$CORS_ORIGINS_VALUE" != "$DASH_URL" ]] && [[ -z "${CORS_ORIGINS:-}" ]]; then
+  echo "==> Tightening CORS_ORIGINS on $API_SERVICE to $DASH_URL"
+  gcloud run services update "$API_SERVICE" \
+    --region "$REGION" \
+    --update-env-vars "CORS_ORIGINS=$DASH_URL" >/dev/null
+fi
 
 echo
 echo "Done."

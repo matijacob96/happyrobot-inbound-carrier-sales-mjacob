@@ -11,17 +11,13 @@ import {
   Wifi,
 } from "lucide-react";
 import { Button } from "./ui/button";
-import { SettingsModal } from "./SettingsModal";
 import { useTheme } from "../lib/theme";
 import { useSearch } from "../lib/search";
 import { cn } from "../lib/utils";
 
 interface MainLayoutProps {
-  needsSetup: boolean;
   loading: boolean;
   onRefresh: () => void;
-  onSettingsSaved: () => void;
-  livePolling: boolean;
 }
 
 const NAV_ITEMS = [
@@ -31,13 +27,7 @@ const NAV_ITEMS = [
   { to: "/loads", label: "Loads", icon: Truck, end: false },
 ];
 
-export function MainLayout({
-  needsSetup,
-  loading,
-  onRefresh,
-  onSettingsSaved,
-  livePolling,
-}: MainLayoutProps) {
+export function MainLayout({ loading, onRefresh }: MainLayoutProps) {
   const { theme, toggle } = useTheme();
   const { query, setQuery } = useSearch();
   const location = useLocation();
@@ -82,8 +72,8 @@ export function MainLayout({
         </nav>
         <div className="p-3 border-t border-slate-200 dark:border-white/5 text-[11px] text-slate-500 dark:text-slate-500">
           <div className="flex items-center gap-2">
-            <Wifi className={cn("h-3 w-3", livePolling ? "text-emerald-500" : "text-slate-400")} />
-            <span>{livePolling ? "Live · 10s" : "Idle"}</span>
+            <Wifi className="h-3 w-3 text-emerald-500" />
+            <span>Live · 10s</span>
           </div>
           <div className="mt-1">FDE Technical Challenge</div>
         </div>
@@ -129,7 +119,6 @@ export function MainLayout({
                 <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
                 Refresh
               </Button>
-              <SettingsModal forceOpen={needsSetup} onSaved={onSettingsSaved} />
             </div>
           </div>
 
