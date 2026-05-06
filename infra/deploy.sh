@@ -20,14 +20,15 @@ set -euo pipefail
 REGION="${REGION:-us-central1}"
 API_SERVICE="${API_SERVICE:-hr-api}"
 DASHBOARD_SERVICE="${DASHBOARD_SERVICE:-hr-dashboard}"
-# FMCSA_MOCK=true keeps verify_carrier in mock mode (default while FMCSA key is being sorted out).
-# Flip with: gcloud run services update $API_SERVICE --region $REGION --update-env-vars FMCSA_MOCK=false
-FMCSA_MOCK="${FMCSA_MOCK:-true}"
+# Optional: a free Socrata App Token at data.transportation.gov raises rate
+# limits for FMCSA carrier lookups. Bind via secret if you have one:
+#   echo -n "<TOKEN>" | gcloud secrets create hr-fmcsa-app-token --data-file=-
+USE_FMCSA_TOKEN="$(gcloud secrets describe hr-fmcsa-app-token >/dev/null 2>&1 && echo yes || echo no)"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-echo "==> Project: $PROJECT_ID  Region: $REGION  FMCSA_MOCK=$FMCSA_MOCK"
+echo "==> Project: $PROJECT_ID  Region: $REGION  FMCSA App Token bound: $USE_FMCSA_TOKEN"
 gcloud config set project "$PROJECT_ID" >/dev/null
 
 # 1. Enable required services (idempotent)
@@ -39,24 +40,26 @@ gcloud services enable \
   firestore.googleapis.com \
   secretmanager.googleapis.com >/dev/null
 
-# 2. Make sure the secrets exist. Bootstrap them once with:
-#    echo -n "$(openssl rand -hex 32)" | gcloud secrets create hr-api-key   --data-file=-
-#    echo -n "<FMCSA_KEY>"             | gcloud secrets create hr-fmcsa-key --data-file=-
-for s in hr-api-key hr-fmcsa-key; do
-  if ! gcloud secrets describe "$s" >/dev/null 2>&1; then
-    echo "ERROR: secret '$s' missing. Create it first:"
-    echo "  echo -n '<value>' | gcloud secrets create $s --data-file=-"
-    exit 1
-  fi
-done
+# 2. Make sure the required secret exists. Bootstrap it once with:
+#    echo -n "$(openssl rand -hex 32)" | gcloud secrets create hr-api-key --data-file=-
+if ! gcloud secrets describe hr-api-key >/dev/null 2>&1; then
+  echo "ERROR: secret 'hr-api-key' missing. Create it first:"
+  echo "  echo -n '<value>' | gcloud secrets create hr-api-key --data-file=-"
+  exit 1
+fi
+
+# Optional FMCSA App Token. We bind it only if the operator already created
+# the secret; FMCSA Open Data works without it (just with lower rate limits).
+SECRETS_TO_BIND=("hr-api-key")
+[[ "$USE_FMCSA_TOKEN" == "yes" ]] && SECRETS_TO_BIND+=("hr-fmcsa-app-token")
 
 # 2b. Grant the Cloud Run runtime service account access to the secrets.
 # By default, Cloud Run uses {PROJECT_NUMBER}-compute@developer.gserviceaccount.com
 # unless overridden. The role binding is idempotent.
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
 RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-echo "==> Granting $RUNTIME_SA access to secrets"
-for s in hr-api-key hr-fmcsa-key; do
+echo "==> Granting $RUNTIME_SA access to ${SECRETS_TO_BIND[*]}"
+for s in "${SECRETS_TO_BIND[@]}"; do
   gcloud secrets add-iam-policy-binding "$s" \
     --member="serviceAccount:$RUNTIME_SA" \
     --role="roles/secretmanager.secretAccessor" \
@@ -82,6 +85,11 @@ gcloud builds submit . \
   --region="$REGION"
 
 # 4. Deploy the API
+API_SECRETS="API_KEY=hr-api-key:latest"
+if [[ "$USE_FMCSA_TOKEN" == "yes" ]]; then
+  API_SECRETS="$API_SECRETS,FMCSA_SOCRATA_APP_TOKEN=hr-fmcsa-app-token:latest"
+fi
+
 echo "==> Deploying $API_SERVICE"
 gcloud run deploy "$API_SERVICE" \
   --image "gcr.io/$PROJECT_ID/hr-api:latest" \
@@ -92,8 +100,8 @@ gcloud run deploy "$API_SERVICE" \
   --memory 512Mi \
   --concurrency 40 \
   --max-instances 5 \
-  --set-env-vars "NODE_ENV=production,FIREBASE_PROJECT_ID=$PROJECT_ID,CORS_ORIGINS=$CORS_ORIGINS_VALUE,FMCSA_MOCK=$FMCSA_MOCK" \
-  --set-secrets "API_KEY=hr-api-key:latest,FMCSA_API_KEY=hr-fmcsa-key:latest"
+  --set-env-vars "NODE_ENV=production,FIREBASE_PROJECT_ID=$PROJECT_ID,CORS_ORIGINS=$CORS_ORIGINS_VALUE" \
+  --set-secrets "$API_SECRETS"
 
 API_URL="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --format='value(status.url)')"
 echo "    API_URL=$API_URL"

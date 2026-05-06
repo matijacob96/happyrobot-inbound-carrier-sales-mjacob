@@ -16,12 +16,25 @@ end-to-end stack:
   browser never holds a credential).
 - **Shared types** — internal package consumed by both apps.
 - **Infra** — Dockerfiles, Cloud Build configs, idempotent deploy script.
-- **Local dev** — Docker Compose stack with a Firestore emulator and an
-  FMCSA mock that lets you run the whole flow without any GCP project.
+- **Local dev** — Docker Compose stack with a Firestore emulator that lets
+  you run the whole flow without any GCP project.
 
 The HappyRobot side (agent, prompt, four tools, AI Extract / AI Classify
 nodes, webhook) is configured directly on the platform; this repo provides
 the API surface those nodes call.
+
+> **Note on FMCSA verification.** The canonical [FMCSA QCMobile API](https://mobile.fmcsa.dot.gov)
+> requires a free webKey, but FMCSA geo-blocks non-US IP addresses at the
+> network layer (returns `403` before checking credentials). With my webKey
+> request still pending review and development happening from outside the
+> US, I switched the carrier-verification client to FMCSA's
+> [Open Data Program](https://data.transportation.gov/Trucking/FMCSA-Census-File/az4n-8mr2/about_data)
+> on `data.transportation.gov` (Socrata). It exposes the same Company Census
+> File that backs QCMobile, refreshed daily, with no auth and no geo-block.
+> The trade-off — up to 24 h of staleness — is acceptable for carrier
+> eligibility, which changes on the order of weeks. See
+> [`apps/api/src/lib/fmcsa.ts`](apps/api/src/lib/fmcsa.ts) for the rationale
+> and field mappings.
 
 ---
 
@@ -58,7 +71,7 @@ flowchart LR
     SentimentClassify --> WebhookOut["Webhook -> POST /v1/calls"]
     WebhookOut --> API
     API --> Firestore[("Firestore: loads, calls, carriers")]
-    API -->|"verify MC"| FMCSA["FMCSA QCMobile API"]
+    API -->|"verify MC"| FMCSA["FMCSA Open Data<br/>(Socrata · data.transportation.gov)"]
     Browser["Operator browser"] -->|"same-origin /api/*"| Dashboard["nginx BFF (Cloud Run)"]
     Dashboard -->|"x-api-key (from Secret Manager)"| API
 ```
@@ -77,11 +90,11 @@ non-engineers to tune, fewer moving parts to deploy.
 | Voice agent  | HappyRobot platform                                   | Required by the brief; native voice + extract + classify             |
 | Backend      | Node.js 20 + Fastify + Zod                            | Fast bootstrap, schema-validated tool surface for the agent          |
 | Database     | Google Cloud Firestore (Native)                       | Zero-ops, fits POC scale, fast cold start on Cloud Run               |
-| External     | FMCSA QCMobile API                                    | Authoritative source for MC eligibility (mockable for local dev)     |
+| External     | FMCSA Open Data (Socrata)                             | Same authoritative source as QCMobile, refreshed daily, no geo-block |
 | Dashboard    | React 18 + Vite + Tailwind + Recharts + React Router  | Modern UX, multi-page nav, client-side filters, 10 s live polling    |
 | Hosting      | Google Cloud Run                                      | Managed HTTPS, autoscaling, integrates with Secret Manager           |
 | Auth         | `x-api-key` header (constant-time compare)            | Simple, auditable, sufficient for an inbound webhook surface         |
-| Local dev    | Docker Compose + Firestore emulator + FMCSA mock      | Reproducible end-to-end without any GCP project                      |
+| Local dev    | Docker Compose + Firestore emulator                   | Reproducible end-to-end without any GCP project                      |
 | Build        | `gcloud builds submit` + monorepo Dockerfiles         | Reproducible builds from the repo root, no manual Artifact Registry  |
 | Monorepo     | pnpm workspaces                                       | Fast installs, shared TS types between API and dashboard             |
 
@@ -96,7 +109,7 @@ non-engineers to tune, fewer moving parts to deploy.
 │   │   ├── src/
 │   │   │   ├── plugins/         # auth, errors, firestore (Fastify plugins)
 │   │   │   ├── routes/          # health, carriers, loads, calls, metrics
-│   │   │   ├── lib/fmcsa.ts     # FMCSA QCMobile client (with mock fallback)
+│   │   │   ├── lib/fmcsa.ts     # FMCSA Socrata client (Open Data Program)
 │   │   │   ├── scripts/         # seed-loads.ts (idempotent, with --reset-calls)
 │   │   │   ├── config.ts        # env-var loader (Zod-validated)
 │   │   │   └── server.ts        # Fastify bootstrap
@@ -137,7 +150,7 @@ non-engineers to tune, fewer moving parts to deploy.
 | Docker           | 24+      | Local stack (`docker compose`)          |
 | `gcloud` CLI     | latest   | Cloud Run / Firestore / Secret Manager  |
 | A GCP project    | —        | Production deployment                   |
-| (Optional) FMCSA API key | —        | Live MC verification (else use mock)    |
+| (Optional) FMCSA Socrata App Token | — | Higher rate limits on FMCSA lookups (free) |
 
 ---
 
@@ -145,7 +158,8 @@ non-engineers to tune, fewer moving parts to deploy.
 
 The fastest way to run the full stack is the Compose file at the repo root.
 It boots a Firestore emulator, the API and the dashboard, all wired together
-with sensible defaults and the FMCSA mock turned on.
+with sensible defaults. FMCSA carrier lookups go against the public Open
+Data dataset on `data.transportation.gov` — no key, no VPN, no geo-block.
 
 ```bash
 # 1. Install workspace dependencies
@@ -190,7 +204,7 @@ API_KEY=$(grep '^API_KEY=' .env | cut -d= -f2)
 # Liveness
 curl http://localhost:8080/health
 
-# Verify a carrier (mock returns eligible for MC 123456)
+# Verify a carrier (real lookup against FMCSA Open Data on Socrata)
 curl -X POST http://localhost:8080/v1/carriers/verify \
   -H "x-api-key: $API_KEY" \
   -H "content-type: application/json" \
@@ -241,10 +255,9 @@ local dev (via `.env` / `docker-compose.yml`) and for Cloud Run (via
 | `API_KEY`               | yes      | —                                       | Shared secret, sent by HappyRobot + dashboard as `x-api-key` |
 | `FIREBASE_PROJECT_ID`   | yes      | —                                       | GCP project ID (or any string when using the emulator) |
 | `FIRESTORE_EMULATOR_HOST` | no    | unset                                   | Set to `host:port` to use the local emulator instead of GCP |
-| `FMCSA_API_KEY`         | yes\*    | —                                       | \*Required only when `FMCSA_MOCK=false` |
-| `FMCSA_BASE_URL`        | no       | `https://mobile.fmcsa.dot.gov/qc/services` | |
-| `FMCSA_CACHE_TTL_HOURS` | no       | `24`                                    | Carrier eligibility cache TTL |
-| `FMCSA_MOCK`            | no       | `true`                                  | Returns deterministic eligible carriers without calling FMCSA. Useful when running outside the US (FMCSA's public endpoint geo-blocks non-US IPs). Set to `false` when deployed in `us-central1`. |
+| `FMCSA_SOCRATA_URL`        | no    | `https://data.transportation.gov`       | Base URL for the FMCSA Company Census dataset (`az4n-8mr2`) on Socrata. |
+| `FMCSA_SOCRATA_APP_TOKEN`  | no    | —                                        | Optional. A free Socrata App Token raises rate limits; not required for correctness. |
+| `FMCSA_CACHE_TTL_HOURS`    | no    | `24`                                    | Cache TTL for carrier verification results in Firestore (mirrors the dataset's daily refresh). |
 | `CORS_ORIGINS`          | no       | `*`                                     | Comma-separated allowlist. In Cloud Run this is set to `*` for the POC; tighten in production. |
 
 ### Dashboard (`apps/dashboard`)
@@ -272,7 +285,7 @@ not require either.
 | Method | Path                            | Auth | Description                                              |
 | ------ | ------------------------------- | ---- | -------------------------------------------------------- |
 | `GET`  | `/health`                       | no   | Liveness probe, returns `{ "status": "ok" }`              |
-| `POST` | `/v1/carriers/verify`           | yes  | Verifies an MC number against FMCSA, caches the result   |
+| `POST` | `/v1/carriers/verify`           | yes  | Verifies an MC number against FMCSA Open Data, caches the result for 24 h |
 | `GET`  | `/v1/loads/search`              | yes  | Top-N matching loads (filters: `origin`, `destination`, `equipment_type`, `pickup_after`, `max_weight`, `limit`) |
 | `GET`  | `/v1/loads`                     | yes  | Lists loads ordered by pickup datetime, optional `status` filter |
 | `GET`  | `/v1/loads/:load_id`            | yes  | Single load details                                      |
@@ -310,9 +323,12 @@ gcloud services enable \
 # Create the Firestore database (Native mode)
 gcloud firestore databases create --location="$REGION" --type=firestore-native
 
-# Create secrets that Cloud Run will mount as env vars
-echo -n "$(openssl rand -hex 32)"   | gcloud secrets create hr-api-key   --data-file=-
-echo -n "<your-fmcsa-api-key-or-x>" | gcloud secrets create hr-fmcsa-key --data-file=-
+# Create the API key secret that Cloud Run mounts as an env var
+echo -n "$(openssl rand -hex 32)" | gcloud secrets create hr-api-key --data-file=-
+
+# (Optional) Add a Socrata App Token to raise FMCSA rate limits.
+# Get one for free at https://data.transportation.gov/profile/app_tokens
+# echo -n "<TOKEN>" | gcloud secrets create hr-fmcsa-app-token --data-file=-
 ```
 
 ### Deploy
@@ -324,7 +340,7 @@ PROJECT_ID="$PROJECT_ID" REGION="$REGION" ./infra/deploy.sh
 What the script does, in order:
 
 1. Enables the APIs above (idempotent).
-2. Verifies that `hr-api-key` and `hr-fmcsa-key` secrets exist.
+2. Verifies that the `hr-api-key` secret exists (and binds the optional `hr-fmcsa-app-token` if present).
 3. Grants the Cloud Run runtime service account
    (`{PROJECT_NUMBER}-compute@developer.gserviceaccount.com`) the
    `roles/secretmanager.secretAccessor` role on both secrets.
@@ -522,8 +538,9 @@ authentication. This POC delivers that, plus several extras:
 - **CORS** allowlist driven by `CORS_ORIGINS`. The deploy script tightens
   it to the dashboard's Cloud Run URL after the first deploy, so direct
   browser calls from other origins are rejected.
-- **Secrets** (`API_KEY`, `FMCSA_API_KEY`) bound from Google Secret Manager
-  at deploy time. Never committed to the repo or container image.
+- **Secrets** (`API_KEY`, optional `FMCSA_SOCRATA_APP_TOKEN`) bound from
+  Google Secret Manager at deploy time. Never committed to the repo or
+  container image.
 - **Schema validation** (Zod) on every input and output.
 - **Backend-for-Frontend (BFF)** in the dashboard container: nginx serves
   the SPA and proxies `/api/*` to the API, injecting `x-api-key` from a
@@ -555,7 +572,7 @@ the key by scope:
 | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Dashboard shows *Failed to fetch*                                    | The BFF (nginx in the dashboard container) cannot reach `UPSTREAM_API`. In docker-compose, make sure both `api` and `dashboard` are up; in Cloud Run, confirm `UPSTREAM_API` was set on `hr-dashboard` and that it points at the API URL (`gcloud run services describe hr-dashboard --region $REGION --format='value(spec.template.spec.containers[0].env)'`). |
 | Dashboard shows 401 / 403 from `/api/...`                            | The BFF is up but the `API_KEY` secret was not bound. Re-run `infra/deploy.sh` so the `--set-secrets API_KEY=hr-api-key:latest` flag is applied. Locally, make sure `API_KEY` is set in `.env`. |
-| `verify_carrier` returns 403 from FMCSA                              | The public FMCSA endpoint geo-blocks non-US IPs. For local dev set `FMCSA_MOCK=true`; in Cloud Run pick a US region and set `FMCSA_MOCK=false`.                      |
+| `verify_carrier` returns `fmcsa_unavailable` after 12 s              | Socrata's anonymous endpoint occasionally times out. The client retries once automatically. Persistent failures: register a free App Token at `data.transportation.gov` and bind it as `hr-fmcsa-app-token` (the deploy script picks it up automatically). |
 | Seed script aborts with *"Refusing to seed/reset against Firestore"* | The script refuses to wipe a real GCP project unless you opt in. Either set `FIRESTORE_EMULATOR_HOST=...` (local) or pass `--allow-production`.                      |
 | `gcloud builds submit` complains about missing files                 | Run from the repo root; the Dockerfiles assume the monorepo as the build context. The deploy script does this automatically.                                         |
 | Cloud Run logs *"Permission denied on secret"*                       | The runtime service account is missing `roles/secretmanager.secretAccessor`. The deploy script grants this; re-run it.                                               |

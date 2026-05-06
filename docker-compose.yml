@@ -21,9 +21,9 @@ services:
       API_KEY: ${API_KEY:-dev-local-api-key-change-me}
       FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-happyrobot-fde-poc}
       FIRESTORE_EMULATOR_HOST: firestore-emulator:8080
-      FMCSA_API_KEY: ${FMCSA_API_KEY:-replace-me}
-      FMCSA_BASE_URL: ${FMCSA_BASE_URL:-https://mobile.fmcsa.dot.gov/qc/services}
-      FMCSA_MOCK: ${FMCSA_MOCK:-true}
+      FMCSA_SOCRATA_URL: ${FMCSA_SOCRATA_URL:-https://data.transportation.gov}
+      FMCSA_SOCRATA_APP_TOKEN: ${FMCSA_SOCRATA_APP_TOKEN:-}
+      FMCSA_CACHE_TTL_HOURS: ${FMCSA_CACHE_TTL_HOURS:-24}
       # The dashboard reaches the API through its own nginx BFF (same-origin),
       # so CORS is not exercised in the normal browser flow. Keep loose locally
       # to allow direct curl/Postman testing.

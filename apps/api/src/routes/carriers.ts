@@ -23,13 +23,9 @@ const VerifyResponse = z.object({
 
 export async function carriersRoutes(app: FastifyInstance): Promise<void> {
   const fmcsa = new FmcsaClient(
-    app.config.FMCSA_BASE_URL,
-    app.config.FMCSA_API_KEY,
-    app.config.FMCSA_MOCK,
+    app.config.FMCSA_SOCRATA_URL,
+    app.config.FMCSA_SOCRATA_APP_TOKEN,
   );
-  if (app.config.FMCSA_MOCK) {
-    app.log.warn("FMCSA_MOCK=true — carrier verification is in mock mode");
-  }
   const cacheTtlMs = app.config.FMCSA_CACHE_TTL_HOURS * 60 * 60 * 1000;
 
   app.withTypeProvider<ZodTypeProvider>().post(
@@ -74,7 +70,21 @@ export async function carriersRoutes(app: FastifyInstance): Promise<void> {
         verified_at: now,
       };
 
-      await docRef.set(record, { merge: true });
+      // Only persist *deterministic* answers. Transient outcomes (timeouts,
+      // 5xx, rate limits) must NOT be cached for 24 h — that would lock a
+      // valid carrier out for a day after a single bad upstream call.
+      const isTransient = fresh.reasons.some((r) =>
+        r === "fmcsa_unavailable" || r === "fmcsa_rate_limited",
+      );
+      if (!isTransient) {
+        await docRef.set(record, { merge: true });
+      } else {
+        app.log.warn(
+          { mc_number: normalized, reasons: fresh.reasons },
+          "FMCSA transient error — not persisting to cache",
+        );
+      }
+
       return { ...record, cached: false };
     },
   );

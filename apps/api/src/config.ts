@@ -10,12 +10,13 @@ const envSchema = z.object({
   FIREBASE_PROJECT_ID: z.string().min(1),
   FIRESTORE_EMULATOR_HOST: z.string().optional(),
 
-  FMCSA_API_KEY: z.string().min(1),
-  FMCSA_BASE_URL: z.string().url().default("https://mobile.fmcsa.dot.gov/qc/services"),
+  // FMCSA carrier lookups go against the Company Census dataset on
+  // data.transportation.gov (Socrata). See lib/fmcsa.ts for the rationale.
+  FMCSA_SOCRATA_URL: z.string().url().default("https://data.transportation.gov"),
+  // Optional: registering a free App Token at data.transportation.gov raises
+  // the per-IP rate limit. Not required for correctness.
+  FMCSA_SOCRATA_APP_TOKEN: z.string().optional(),
   FMCSA_CACHE_TTL_HOURS: z.coerce.number().int().positive().default(24),
-  // Set to "true" to bypass the FMCSA HTTP call and accept any MC with 6+ digits.
-  // Useful for local development from non-US IPs (FMCSA geo-blocks the endpoint).
-  FMCSA_MOCK: z.coerce.boolean().default(false),
 
   CORS_ORIGINS: z.string().default("*"),
 });
